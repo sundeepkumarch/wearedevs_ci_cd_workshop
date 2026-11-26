@@ -1,0 +1,190 @@
+name: Daily Repo Status
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: daily-repo-status
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post daily repository status
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo
+            const title = 'Daily Status Reports'
+            const today = new Date().toISOString().slice(0, 10)
+            const marker = `📊 Daily Repo Status — ${today}`
+
+            const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'all',
+              per_page: 100,
+            })
+            let reportIssue = allIssues.find(
+              (issue) => !issue.pull_request && issue.title === title
+            )
+            if (!reportIssue) {
+              const { data } = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body: 'Daily repository health reports are posted here once per calendar day (UTC).',
+              })
+              reportIssue = data
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: reportIssue.number,
+              per_page: 100,
+            })
+            if (comments.some((comment) => comment.body?.startsWith(marker))) {
+              core.notice(`A report for ${today} UTC already exists; skipping.`)
+              return
+            }
+
+            async function collectOrUnknown(name, collect) {
+              try {
+                return await collect()
+              } catch (error) {
+                core.warning(`Could not collect ${name}: ${error.message}`)
+                return null
+              }
+            }
+
+            const defaultBranch = await collectOrUnknown('the default branch', async () => {
+              const { data } = await github.rest.repos.get({ owner, repo })
+              return data.default_branch
+            })
+
+            const [pullRequests, issues, ciStatus, lastCommit] = await Promise.all([
+              collectOrUnknown('open pull requests', async () => (
+                github.paginate(github.rest.pulls.list, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  per_page: 100,
+                })
+              )),
+              collectOrUnknown('open issues', async () => (
+                github.paginate(github.rest.issues.listForRepo, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  per_page: 100,
+                }).then((items) => items.filter((item) => !item.pull_request))
+              )),
+              collectOrUnknown('the most recent CI run', async () => {
+                if (!defaultBranch) return null
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner,
+                  repo,
+                  per_page: 100,
+                })
+                const latestRun = data.workflow_runs.find(
+                  (run) => run.id !== context.runId
+                    && run.name !== context.workflow
+                    && run.head_branch === defaultBranch
+                )
+                if (!latestRun || latestRun.status !== 'completed') return 'unknown'
+                return latestRun.conclusion === 'success' ? 'passing' : 'failing'
+              }),
+              collectOrUnknown('the most recent commit', async () => {
+                if (!defaultBranch) return null
+                const { data } = await github.rest.repos.listCommits({
+                  owner,
+                  repo,
+                  sha: defaultBranch,
+                  per_page: 1,
+                })
+                return data[0] || null
+              }),
+            ])
+
+            const openIssues = issues
+            const bugCount = openIssues === null
+              ? null
+              : openIssues.filter((issue) =>
+                  issue.labels.some(
+                    (label) => typeof label === 'object' && label.name?.toLowerCase() === 'bug'
+                  )
+                ).length
+            const pullRequestCount = pullRequests === null ? null : pullRequests.length
+            const issueCount = openIssues === null ? null : openIssues.length
+            const pullRequestTitles = pullRequests === null
+              ? 'unknown'
+              : pullRequests.length === 0
+                ? 'none'
+                : pullRequests.map((pullRequest) => `#${pullRequest.number} — ${pullRequest.title}`).join('; ')
+
+            function timeAgo(timestamp) {
+              const milliseconds = Date.now() - new Date(timestamp).getTime()
+              if (!Number.isFinite(milliseconds)) return 'unknown'
+              const minutes = Math.max(0, Math.floor(milliseconds / 60_000))
+              if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`
+              const hours = Math.floor(minutes / 60)
+              if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`
+              const days = Math.floor(hours / 24)
+              return `${days} day${days === 1 ? '' : 's'} ago`
+            }
+
+            const commitMessage = lastCommit?.commit.message?.split('\n')[0]
+              ?.replaceAll('"', '\\"') || 'unknown'
+            const commitTimestamp = lastCommit?.commit.committer?.date
+              || lastCommit?.commit.author?.date
+            const lastCommitTime = commitTimestamp ? timeAgo(commitTimestamp) : 'unknown'
+            const ci = typeof ciStatus === 'string' ? ciStatus : 'unknown'
+
+            const concerns = []
+            if (ci === 'failing') concerns.push('CI is failing')
+            if (bugCount !== null && bugCount > 0) {
+              concerns.push(`${bugCount} open issue${bugCount === 1 ? '' : 's'} labeled "bug"`)
+            }
+            const unavailable = []
+            if (pullRequestCount === null) unavailable.push('pull request data')
+            if (issueCount === null) unavailable.push('issue data')
+            if (ci === 'unknown') unavailable.push('CI status')
+            if (commitMessage === 'unknown') unavailable.push('last commit data')
+
+            let health
+            if (concerns.length > 0) {
+              health = `Overall health needs attention: ${concerns.join('; ')}.`
+            } else if (unavailable.length > 0) {
+              health = `Overall health is unclear because ${unavailable.join(', ')} is unavailable.`
+            } else {
+              health = 'Overall health is good: CI is passing and there are no open bug-labeled issues.'
+            }
+
+            const body = [
+              marker,
+              '══════════════════════════════════',
+              `🔀 Open pull requests:  ${pullRequestCount ?? 'unknown'}`,
+              `   Titles: ${pullRequestTitles}`,
+              `🐛 Open issues:         ${issueCount ?? 'unknown'}  (${bugCount ?? 'unknown'} labeled "bug")`,
+              `✅ CI status:           ${ci}`,
+              `📝 Last commit:         "${commitMessage}" — ${lastCommitTime}`,
+              '',
+              health,
+            ].join('\n')
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: reportIssue.number,
+              body,
+            })
